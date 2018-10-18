@@ -20,7 +20,7 @@ namespace Microsoft.AspNetCore.Blazor.RenderTree
             var editsBuffer = batchBuilder.EditsBuffer;
             var editsBufferStartLength = editsBuffer.Count;
 
-            var diffContext = new DiffContext(renderer, batchBuilder, oldTree.Array, newTree.Array);
+            var diffContext = new DiffContext(renderer, batchBuilder, componentId, oldTree.Array, newTree.Array);
             AppendDiffEntriesForRange(ref diffContext, 0, oldTree.Count, 0, newTree.Count);
 
             var editsSegment = editsBuffer.ToSegment(editsBufferStartLength, editsBuffer.Count);
@@ -267,11 +267,10 @@ namespace Microsoft.AspNetCore.Blazor.RenderTree
             var newTree = diffContext.NewTree;
             ref var oldComponentFrame = ref oldTree[oldComponentIndex];
             ref var newComponentFrame = ref newTree[newComponentIndex];
-            var componentId = oldComponentFrame.ComponentId;
-            var componentInstance = oldComponentFrame.Component;
+            var componentState = oldComponentFrame.ComponentState;
 
             // Preserve the actual componentInstance
-            newComponentFrame = newComponentFrame.WithComponentInstance(componentId, componentInstance);
+            newComponentFrame = newComponentFrame.WithComponent(componentState);
 
             // As an important rendering optimization, we want to skip parameter update
             // notifications if we know for sure they haven't changed/mutated. The
@@ -287,7 +286,7 @@ namespace Microsoft.AspNetCore.Blazor.RenderTree
             var newParameters = new ParameterCollection(newTree, newComponentIndex);
             if (!newParameters.DefinitelyEquals(oldParameters))
             {
-                componentInstance.SetParameters(newParameters);
+                componentState.SetDirectParameters(newParameters);
             }
         }
 
@@ -633,17 +632,18 @@ namespace Microsoft.AspNetCore.Blazor.RenderTree
             var frames = diffContext.NewTree;
             ref var frame = ref frames[frameIndex];
 
-            if (frame.Component != null)
+            if (frame.ComponentState != null)
             {
                 throw new InvalidOperationException($"Child component already exists during {nameof(InitializeNewComponentFrame)}");
             }
 
-            diffContext.Renderer.InstantiateChildComponentOnFrame(ref frame);
-            var childComponentInstance = frame.Component;
+            var parentComponentId = diffContext.ComponentId;
+            diffContext.Renderer.InstantiateChildComponentOnFrame(ref frame, parentComponentId);
+            var childComponentState = frame.ComponentState;
 
             // Set initial parameters
             var initialParameters = new ParameterCollection(frames, frameIndex);
-            childComponentInstance.SetParameters(initialParameters);
+            childComponentState.SetDirectParameters(initialParameters);
         }
 
         private static void InitializeNewAttributeFrame(ref DiffContext diffContext, ref RenderTreeFrame newFrame)
@@ -691,7 +691,7 @@ namespace Microsoft.AspNetCore.Blazor.RenderTree
             for (var i = startIndex; i < endIndexExcl; i++)
             {
                 ref var frame = ref frames[i];
-                if (frame.FrameType == RenderTreeFrameType.Component && frame.Component != null)
+                if (frame.FrameType == RenderTreeFrameType.Component && frame.ComponentState != null)
                 {
                     batchBuilder.ComponentDisposalQueue.Enqueue(frame.ComponentId);
                 }
@@ -718,16 +718,19 @@ namespace Microsoft.AspNetCore.Blazor.RenderTree
             public readonly ArrayBuilder<RenderTreeEdit> Edits;
             public readonly ArrayBuilder<RenderTreeFrame> ReferenceFrames;
             public readonly Dictionary<string, int> AttributeDiffSet;
+            public readonly int ComponentId;
             public int SiblingIndex;
 
             public DiffContext(
                 Renderer renderer,
                 RenderBatchBuilder batchBuilder,
+                int componentId,
                 RenderTreeFrame[] oldTree,
                 RenderTreeFrame[] newTree)
             {
                 Renderer = renderer;
                 BatchBuilder = batchBuilder;
+                ComponentId = componentId;
                 OldTree = oldTree;
                 NewTree = newTree;
                 Edits = batchBuilder.EditsBuffer;

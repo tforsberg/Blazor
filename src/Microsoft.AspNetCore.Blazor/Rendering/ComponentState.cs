@@ -1,7 +1,8 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using Microsoft.AspNetCore.Blazor.Components;
 using Microsoft.AspNetCore.Blazor.RenderTree;
 
@@ -15,11 +16,19 @@ namespace Microsoft.AspNetCore.Blazor.Rendering
     internal class ComponentState
     {
         private readonly int _componentId; // TODO: Change the type to 'long' when the Mono runtime has more complete support for passing longs in .NET->JS calls
+        private readonly ComponentState _parentComponentState;
         private readonly IComponent _component;
         private readonly Renderer _renderer;
+        private readonly IReadOnlyList<CascadingParameterState> _cascadingParameters;
+        private readonly bool _hasAnyCascadingParameterSubscriptions;
         private RenderTreeBuilder _renderTreeBuilderCurrent;
         private RenderTreeBuilder _renderTreeBuilderPrevious;
+        private ArrayBuilder<RenderTreeFrame> _latestDirectParametersSnapshot; // Lazily instantiated
         private bool _componentWasDisposed;
+
+        public int ComponentId => _componentId;
+        public IComponent Component => _component;
+        public ComponentState ParentComponentState => _parentComponentState;
 
         /// <summary>
         /// Constructs an instance of <see cref="ComponentState"/>.
@@ -27,13 +36,21 @@ namespace Microsoft.AspNetCore.Blazor.Rendering
         /// <param name="renderer">The <see cref="Renderer"/> with which the new instance should be associated.</param>
         /// <param name="componentId">The externally visible identifier for the <see cref="IComponent"/>. The identifier must be unique in the context of the <see cref="Renderer"/>.</param>
         /// <param name="component">The <see cref="IComponent"/> whose state is being tracked.</param>
-        public ComponentState(Renderer renderer, int componentId, IComponent component)
+        /// <param name="parentComponentState">The <see cref="ComponentState"/> for the parent component, or null if this is a root component.</param>
+        public ComponentState(Renderer renderer, int componentId, IComponent component, ComponentState parentComponentState)
         {
             _componentId = componentId;
+            _parentComponentState = parentComponentState;
             _component = component ?? throw new ArgumentNullException(nameof(component));
             _renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
+            _cascadingParameters = CascadingParameterState.FindCascadingParameters(this);
             _renderTreeBuilderCurrent = new RenderTreeBuilder(renderer);
             _renderTreeBuilderPrevious = new RenderTreeBuilder(renderer);
+
+            if (_cascadingParameters != null)
+            {
+                _hasAnyCascadingParameterSubscriptions = AddCascadingParameterSubscriptions();
+            }
         }
 
         public void RenderIntoBatch(RenderBatchBuilder batchBuilder, RenderFragment renderFragment)
@@ -71,6 +88,11 @@ namespace Microsoft.AspNetCore.Blazor.Rendering
             }
 
             RenderTreeDiffBuilder.DisposeFrames(batchBuilder, _renderTreeBuilderCurrent.GetFrames());
+
+            if (_hasAnyCascadingParameterSubscriptions)
+            {
+                RemoveCascadingParameterSubscriptions();
+            }
         }
 
         public void DispatchEvent(EventHandlerInvoker binding, UIEventArgs eventArgs)
@@ -89,5 +111,70 @@ namespace Microsoft.AspNetCore.Blazor.Rendering
 
         public void NotifyRenderCompleted()
             => (_component as IHandleAfterRender)?.OnAfterRender();
+
+        public void SetDirectParameters(ParameterCollection parameters)
+        {
+            // Note: We should be careful to ensure that the framework never calls
+            // IComponent.SetParameters directly elsewhere. We should only call it
+            // via ComponentState.SetParameters (or NotifyCascadingValueChanged below).
+            // If we bypass this, the component won't receive the cascading parameters nor
+            // will it update its snapshot of direct parameters.
+
+            if (_hasAnyCascadingParameterSubscriptions)
+            {
+                // We may need to replay these direct parameters later (in NotifyCascadingValueChanged),
+                // but we can't guarantee that the original underlying data won't have mutated in the
+                // meantime, since it's just an index into the parent's RenderTreeFrames buffer.
+                if (_latestDirectParametersSnapshot == null)
+                {
+                    _latestDirectParametersSnapshot = new ArrayBuilder<RenderTreeFrame>();
+                }
+
+                parameters.CaptureSnapshot(_latestDirectParametersSnapshot);
+            }
+
+            if (_cascadingParameters != null)
+            {
+                parameters = parameters.WithCascadingParameters(_cascadingParameters);
+            }
+
+            Component.SetParameters(parameters);
+        }
+
+        public void NotifyCascadingValueChanged()
+        {
+            var directParams = _latestDirectParametersSnapshot != null
+                ? new ParameterCollection(_latestDirectParametersSnapshot.Buffer, 0)
+                : ParameterCollection.Empty;
+            var allParams = directParams.WithCascadingParameters(_cascadingParameters);
+            Component.SetParameters(allParams);
+        }
+
+        private bool AddCascadingParameterSubscriptions()
+        {
+            var hasSubscription = false;
+            var numCascadingParameters = _cascadingParameters.Count;
+
+            for (var i = 0; i < numCascadingParameters; i++)
+            {
+                var valueSupplier = _cascadingParameters[i].ValueSupplier;
+                if (!valueSupplier.CurrentValueIsFixed)
+                {
+                    valueSupplier.Subscribe(this);
+                    hasSubscription = true;
+                }
+            }
+            
+            return hasSubscription;
+        }
+
+        private void RemoveCascadingParameterSubscriptions()
+        {
+            var numCascadingParameters = _cascadingParameters.Count;
+            for (var i = 0; i < numCascadingParameters; i++)
+            {
+                _cascadingParameters[i].ValueSupplier.Unsubscribe(this);
+            }
+        }
     }
 }
